@@ -1,12 +1,15 @@
 from collections import defaultdict
 
-from mindsdb_sql.parser.ast import (
+from mindsdb_sql_parser.ast import (
     Identifier,
     Select,
-    Star
+    Star,
+    Constant,
+    Parameter
 )
-from mindsdb_sql.planner.steps import SubSelectStep, QueryStep
-from mindsdb_sql.planner.utils import query_traversal
+from mindsdb.api.executor.planner.step_result import Result
+from mindsdb.api.executor.planner.steps import SubSelectStep, QueryStep
+from mindsdb.integrations.utilities.query_traversal import query_traversal
 
 from mindsdb.api.executor.sql_query.result_set import ResultSet, Column
 from mindsdb.api.executor.utilities.sql import query_df
@@ -41,6 +44,9 @@ class SubSelectStepCall(BaseStepCall):
             def f_all_cols(node, **kwargs):
                 if isinstance(node, Identifier):
                     query_cols.add(node.parts[-1])
+                elif isinstance(node, Result):
+                    prev_result = self.steps_data[node.step_num]
+                    return Constant(prev_result.get_column_values(col_idx=0)[0])
 
             query_traversal(query.where, f_all_cols)
 
@@ -49,6 +55,15 @@ class SubSelectStepCall(BaseStepCall):
             for col_name in query_cols:
                 if col_name not in result_cols:
                     result.add_column(Column(col_name))
+
+        # inject previous step values
+        if isinstance(query, Select):
+
+            def inject_values(node, **kwargs):
+                if isinstance(node, Parameter) and isinstance(node.value, Result):
+                    prev_result = self.steps_data[node.value.step_num]
+                    return Constant(prev_result.get_column_values(col_idx=0)[0])
+            query_traversal(query, inject_values)
 
         df = result.to_df()
         res = query_df(df, query, session=self.session)
@@ -86,6 +101,12 @@ class QueryStepCall(BaseStepCall):
             if col.table_name != col.table_alias:
                 tbl_idx[col.table_alias].append(name)
 
+        # get aliases of first level
+        aliases = []
+        for col in query.targets:
+            if col.alias is not None:
+                aliases.append(col.alias.parts[0])
+
         # analyze condition and change name of columns
         def check_fields(node, is_target=None, **kwargs):
 
@@ -106,11 +127,18 @@ class QueryStepCall(BaseStepCall):
 
                 if len(node.parts) == 1:
                     key = col_name
+                    if key in aliases:
+                        # key is defined as alias
+                        return
                 else:
                     table_name = node.parts[-2]
                     key = (table_name, col_name)
 
                 if key not in col_idx:
+                    if len(node.parts) == 1:
+                        # it can be local alias of a query
+                        return
+
                     raise KeyColumnDoesNotExist(f'Table not found for column: {key}')
 
                 new_name = col_idx[key]

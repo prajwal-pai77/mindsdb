@@ -10,16 +10,14 @@ import pandas as pd
 from langchain.agents import AgentExecutor
 from langchain.agents.initialize import initialize_agent
 from langchain.chains.conversation.memory import ConversationSummaryBufferMemory
-from langchain.schema import SystemMessage
 from langchain_community.chat_models import (
-    ChatAnthropic,
-    ChatOpenAI,
     ChatAnyscale,
     ChatLiteLLM,
-    ChatOllama,
-)
-from langchain_core.embeddings import Embeddings
+    ChatOllama)
+from langchain_core.agents import AgentAction, AgentStep
+
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from langchain_core.messages.base import BaseMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import Tool
 from langfuse import Langfuse
@@ -31,12 +29,12 @@ from mindsdb.integrations.handlers.openai_handler.constants import (
 )
 from mindsdb.integrations.libs.llm.utils import get_llm_config
 from mindsdb.integrations.utilities.handler_utils import get_api_key
-from mindsdb.integrations.handlers.langchain_embedding_handler.langchain_embedding_handler import (
-    construct_model_from_args,
-)
+from mindsdb.integrations.utilities.rag.settings import DEFAULT_RAG_PROMPT_TEMPLATE
 from mindsdb.utilities import log
 from mindsdb.utilities.context_executor import ContextThreadPoolExecutor
 from mindsdb.interfaces.storage import db
+from mindsdb.utilities.context import context as ctx
+
 
 from .mindsdb_chat_model import ChatMindsdb
 from .callback_handlers import LogCallbackHandler, ContextCaptureCallback
@@ -50,16 +48,19 @@ from .constants import (
     DEFAULT_EMBEDDINGS_MODEL_PROVIDER,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MAX_TOKENS,
+    DEFAULT_TIKTOKEN_MODEL_NAME,
     SUPPORTED_PROVIDERS,
     ANTHROPIC_CHAT_MODELS,
     OLLAMA_CHAT_MODELS,
     NVIDIA_NIM_CHAT_MODELS,
     USER_COLUMN,
     ASSISTANT_COLUMN,
-    CONTEXT_COLUMN,
+    CONTEXT_COLUMN
 )
-from mindsdb.interfaces.skills.skill_tool import skill_tool
-from mindsdb.integrations.utilities.rag.settings import DEFAULT_RAG_PROMPT_TEMPLATE
+from mindsdb.interfaces.skills.skill_tool import skill_tool, SkillData
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import SystemMessage
+from langchain_openai import ChatOpenAI
 
 _PARSING_ERROR_PREFIXES = [
     "An output parsing error occurred",
@@ -70,8 +71,11 @@ logger = log.getLogger(__name__)
 
 
 def get_llm_provider(args: Dict) -> str:
+    # If provider is explicitly specified, use that
     if "provider" in args:
         return args["provider"]
+
+    # Check for known model names from other providers first
     if args["model_name"] in ANTHROPIC_CHAT_MODELS:
         return "anthropic"
     if args["model_name"] in OPEN_AI_CHAT_MODELS:
@@ -80,22 +84,45 @@ def get_llm_provider(args: Dict) -> str:
         return "ollama"
     if args["model_name"] in NVIDIA_NIM_CHAT_MODELS:
         return "nvidia_nim"
+
+    # For vLLM, require explicit provider specification
     raise ValueError("Invalid model name. Please define a supported llm provider")
 
 
 def get_embedding_model_provider(args: Dict) -> str:
+    """Get the embedding model provider from args.
+
+    For VLLM, this will use our custom VLLMEmbeddings class from langchain_embedding_handler.
+    """
+    # Check for explicit embedding model provider
     if "embedding_model_provider" in args:
-        return args["embedding_model_provider"]
-    if "embedding_model_provider" not in args:
-        logger.warning(
-            "No embedding model provider specified. trying to use llm provider."
-        )
-        llm_provider = get_llm_provider(args)
-        if llm_provider == 'mindsdb':
-            # We aren't an embeddings provider, so use the default instead.
-            llm_provider = DEFAULT_EMBEDDINGS_MODEL_PROVIDER
-        return args.get("embedding_model_provider", llm_provider)
-    raise ValueError("Invalid model name. Please define provider")
+        provider = args["embedding_model_provider"]
+        if provider == 'vllm':
+            if not (args.get('openai_api_base') and args.get('model')):
+                raise ValueError(
+                    "VLLM embeddings configuration error:\n"
+                    "- Missing required parameters: 'openai_api_base' and/or 'model'\n"
+                    "- Example: openai_api_base='http://localhost:8003/v1', model='your-model-name'"
+                )
+            logger.info("Using custom VLLMEmbeddings class")
+            return 'vllm'
+        return provider
+
+    # Check if LLM provider is vLLM
+    llm_provider = args.get('provider', DEFAULT_EMBEDDINGS_MODEL_PROVIDER)
+    if llm_provider == 'vllm':
+        if not (args.get('openai_api_base') and args.get('model')):
+            raise ValueError(
+                "VLLM embeddings configuration error:\n"
+                "- Missing required parameters: 'openai_api_base' and/or 'model'\n"
+                "- When using VLLM as LLM provider, you must specify the embeddings server location and model\n"
+                "- Example: openai_api_base='http://localhost:8003/v1', model='your-model-name'"
+            )
+        logger.info("Using custom VLLMEmbeddings class")
+        return 'vllm'
+
+    # Default to LLM provider
+    return llm_provider
 
 
 def get_chat_model_params(args: Dict) -> Dict:
@@ -112,44 +139,20 @@ def get_chat_model_params(args: Dict) -> Dict:
     return config_dict
 
 
-def build_embedding_model(args) -> Embeddings:
-    """
-    Build an embeddings model from the given arguments.
-    """
-    # Set up embeddings model if needed.
-    embeddings_args = args.pop("embedding_model_args", {})
-
-    # no embedding model args provided, use default provider.
-    if not embeddings_args:
-        embeddings_provider = get_embedding_model_provider(args)
-        logger.warning(
-            "'embedding_model_args' not found in input params, "
-            f"Trying to use LLM provider: {embeddings_provider}"
-        )
-        embeddings_args["class"] = embeddings_provider
-        # Include API keys if present.
-        embeddings_args.update({k: v for k, v in args.items() if "api_key" in k})
-
-    return construct_model_from_args(embeddings_args)
-
-
 def create_chat_model(args: Dict):
     model_kwargs = get_chat_model_params(args)
 
-    def _get_tiktoken_model_name(model: str) -> str:
-        if model.startswith("gpt-4"):
-            return "gpt-4"
-        return model
-
     if args["provider"] == "anthropic":
         return ChatAnthropic(**model_kwargs)
-    if args["provider"] == "openai":
+    if args["provider"] == "openai" or args["provider"] == "vllm":
+        chat_open_ai = ChatOpenAI(**model_kwargs)
         # Some newer GPT models (e.g. gpt-4o when released) don't have token counting support yet.
         # By setting this manually in ChatOpenAI, we count tokens like compatible GPT models.
-        model_kwargs["tiktoken_model_name"] = _get_tiktoken_model_name(
-            model_kwargs.get("model_name")
-        )
-        return ChatOpenAI(**model_kwargs)
+        try:
+            chat_open_ai.get_num_tokens_from_messages([])
+        except NotImplementedError:
+            chat_open_ai.tiktoken_model_name = DEFAULT_TIKTOKEN_MODEL_NAME
+        return chat_open_ai
     if args["provider"] == "anyscale":
         return ChatAnyscale(**model_kwargs)
     if args["provider"] == "litellm":
@@ -204,11 +207,11 @@ def process_chunk(chunk):
 
 
 class LangchainAgent:
-    def __init__(self, agent: db.Agents, model):
-
+    def __init__(self, agent: db.Agents, model: dict = None):
+        self.agent = agent
+        self.model = model
         self.llm = None
         self.embedding_model = None
-        self.agent = agent
         args = agent.params.copy()
         args["model_name"] = agent.model_name
         args["provider"] = agent.provider
@@ -273,11 +276,20 @@ class LangchainAgent:
             trace_metadata['skills'] = get_skills(self.agent)
             trace_tags = get_tags(trace_metadata)
 
+            # Set our user info to pass into langfuse trace, with fault tolerance in each individual one just incase on purpose
+            trace_metadata['user_id'] = ctx.user_id
+            trace_metadata['session_id'] = ctx.session_id
+            trace_metadata['company_id'] = ctx.company_id
+            trace_metadata['user_class'] = ctx.user_class
+            trace_metadata['email_confirmed'] = ctx.email_confirmed
+
             self.api_trace = self.langfuse.trace(
                 name='api-completion',
                 input=messages,
                 tags=trace_tags,
-                metadata=trace_metadata
+                metadata=trace_metadata,
+                user_id=ctx.user_id,
+                session_id=ctx.session_id,
             )
 
             self.run_completion_span = self.api_trace.span(name='run-completion', input=messages)
@@ -320,18 +332,14 @@ class LangchainAgent:
                 logger.warning(f'Langfuse trace {self.trace_id} not found')
             except Exception as e:
                 logger.error(f'Something went wrong while processing Langfuse trace {self.trace_id}: {str(e)}')
+
         return response
 
-    def _get_completion_stream(
-        self, messages: List[dict]
-    ) -> Iterable[Dict]:
-        """
-        Gets a completion as a stream of chunks from given messages.
+    def _get_completion_stream(self, messages: List[dict]) -> Iterable[Dict]:
+        """Gets a completion as a stream of chunks from given messages.
 
         Args:
             messages (List[dict]): Messages to get completion chunks for
-            trace_id (str): Langfuse trace ID to use
-            observation_id (str): Langfuse parent observation Id to use
 
         Returns:
             chunks (Iterable[object]): Completion chunks
@@ -344,8 +352,6 @@ class LangchainAgent:
         # Back compatibility for old models
         self.provider = args.get("provider", get_llm_provider(args))
 
-        self.embedding_model_provider = args.get('embedding_model_provider', get_embedding_model_provider(args))
-
         df = df.reset_index(drop=True)
         agent = self.create_agent(df, args)
         # Use last message as prompt, remove other questions.
@@ -353,23 +359,16 @@ class LangchainAgent:
         df.iloc[:-1, df.columns.get_loc(user_column)] = None
         return self.stream_agent(df, agent, args)
 
-    def set_embedding_model(self, args):
-        """
-        Set the embedding model for the agent.
-        """
-        self.embedding_model = build_embedding_model(args)
-
     def create_agent(self, df: pd.DataFrame, args: Dict = None) -> AgentExecutor:
         # Set up tools.
         llm = create_chat_model(args)
         self.llm = llm
+
+        # Don't set embedding model for retrieval mode - let the knowledge base handle it
         if args.get("mode") == "retrieval":
-            self.set_embedding_model(args)
             self.args.pop("mode")
 
-        tools = []
-        skills = self.agent.skills or []
-        tools += self.langchain_tools_from_skills(skills, llm)
+        tools = self._langchain_tools_from_skills(llm)
 
         # Prefer prediction prompt template over original if provided.
         prompt_template = args["prompt_template"]
@@ -418,9 +417,20 @@ class LangchainAgent:
         )
         return agent_executor
 
-    def langchain_tools_from_skills(self, skills, llm):
+    def _langchain_tools_from_skills(self, llm):
         # Makes Langchain compatible tools from a skill
-        tools_groups = skill_tool.get_tools_from_skills(skills, llm, self.embedding_model)
+        skills_data = [
+            SkillData(
+                name=rel.skill.name,
+                type=rel.skill.type,
+                params=rel.skill.params,
+                project_id=rel.skill.project_id,
+                agent_tables_list=(rel.parameters or {}).get('tables')
+            )
+            for rel in self.agent.skills_relationships
+        ]
+
+        tools_groups = skill_tool.get_tools_from_skills(skills_data, llm, self.embedding_model)
 
         all_tools = []
         for skill_type, tools in tools_groups.items():
@@ -529,7 +539,7 @@ AI: {response}"""
 
     def run_agent(self, df: pd.DataFrame, agent: AgentExecutor, args: Dict) -> pd.DataFrame:
         base_template = args.get('prompt_template', args['prompt_template'])
-        return_context = args.get('return_context', False)
+        return_context = args.get('return_context', True)
         input_variables = re.findall(r"{{(.*?)}}", base_template)
 
         prompts, empty_prompt_ids = prepare_prompts(df, base_template, input_variables, args.get('user_column', USER_COLUMN))
@@ -600,7 +610,7 @@ AI: {response}"""
     def stream_agent(self, df: pd.DataFrame, agent_executor: AgentExecutor, args: Dict) -> Iterable[Dict]:
         base_template = args.get('prompt_template', args['prompt_template'])
         input_variables = re.findall(r"{{(.*?)}}", base_template)
-        return_context = args.get('return_context', False)
+        return_context = args.get('return_context', True)
 
         prompts, _ = prepare_prompts(df, base_template, input_variables, args.get('user_column', USER_COLUMN))
 
@@ -617,7 +627,10 @@ AI: {response}"""
             raise TypeError("The stream method did not return an iterable")
 
         for chunk in stream_iterator:
-            yield self.process_chunk(chunk)
+            logger.info(f'Processing streaming chunk {chunk}')
+            processed_chunk = self.process_chunk(chunk)
+            logger.info(f'Processed chunk: {processed_chunk}')
+            yield processed_chunk
 
         if return_context:
             # Yield context if required
@@ -638,9 +651,26 @@ AI: {response}"""
     def process_chunk(chunk):
         if isinstance(chunk, dict):
             return {k: LangchainAgent.process_chunk(v) for k, v in chunk.items()}
-        elif isinstance(chunk, list):
+        if isinstance(chunk, list):
             return [LangchainAgent.process_chunk(item) for item in chunk]
-        elif isinstance(chunk, (str, int, float, bool, type(None))):
+        if isinstance(chunk, AgentAction):
+            # Format agent actions properly for streaming.
+            return {
+                'tool': LangchainAgent.process_chunk(chunk.tool),
+                'tool_input': LangchainAgent.process_chunk(chunk.tool_input),
+                'log': LangchainAgent.process_chunk(chunk.log)
+            }
+        if isinstance(chunk, AgentStep):
+            # Format agent steps properly for streaming.
+            return {
+                'action': LangchainAgent.process_chunk(chunk.action),
+                'observation': LangchainAgent.process_chunk(chunk.observation) if chunk.observation else ''
+            }
+        if issubclass(chunk.__class__, BaseMessage):
+            # Extract content from message subclasses properly for streaming.
+            return {
+                'content': chunk.content
+            }
+        if isinstance(chunk, (str, int, float, bool, type(None))):
             return chunk
-        else:
-            return str(chunk)
+        return str(chunk)

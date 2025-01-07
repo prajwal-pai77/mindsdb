@@ -17,6 +17,8 @@ from .types import ChatBotMessage
 
 logger = log.getLogger(__name__)
 
+HOLDING_MESSAGE = "Bot is typing..."
+
 
 class ChatBotTask(BaseTask):
 
@@ -32,6 +34,9 @@ class ChatBotTask(BaseTask):
         self.project_name = db.Project.query.get(bot_record.project_id).name
         self.project_datanode = self.session.datahub.get(self.project_name)
 
+        # get chat handler info
+        self.bot_params = bot_record.params or {}
+
         self.agent_id = bot_record.agent_id
         if self.agent_id is not None:
             self.bot_executor_cls = AgentExecutor
@@ -46,9 +51,6 @@ class ChatBotTask(BaseTask):
         if not isinstance(self.chat_handler, APIChatHandler):
             raise Exception(f"Can't use chat database: {database_name}")
 
-        # get chat handler info
-        self.bot_params = bot_record.params or {}
-
         chat_params = self.chat_handler.get_chat_config()
         polling = chat_params['polling']['type']
         if polling == 'message_count':
@@ -57,6 +59,7 @@ class ChatBotTask(BaseTask):
             self.memory = HandlerMemory(self, chat_params)
 
         elif polling == 'realtime':
+            chat_params = chat_params['tables'] if 'tables' in chat_params else [chat_params]
             self.chat_pooling = RealtimePolling(self, chat_params)
             self.memory = DBMemory(self, chat_params)
 
@@ -81,6 +84,7 @@ class ChatBotTask(BaseTask):
             raise Exception('chat_id or chat_memory should be provided')
 
         try:
+            self._on_holding_message(chat_id, table_name)
             self._on_message(message, chat_id, chat_memory, table_name)
         except (SystemExit, KeyboardInterrupt):
             raise
@@ -88,6 +92,28 @@ class ChatBotTask(BaseTask):
             error = traceback.format_exc()
             logger.error(error)
             self.set_error(str(error))
+
+    def _on_holding_message(self, chat_id: str, table_name: str = None):
+        """
+        Send a message to hold the user's attention while the bot is processing the request.
+        This message will not be saved in the chat memory.
+
+        Args:
+            chat_id (str): The ID of the chat.
+            table_name (str): The name of the table.
+        """
+        response_message = ChatBotMessage(
+            ChatBotMessage.Type.DIRECT,
+            HOLDING_MESSAGE,
+            # In Slack direct messages are treated as channels themselves.
+            user=self.bot_params['bot_username'],
+            destination=chat_id,
+            sent_at=dt.datetime.now()
+        )
+
+        # send to chat adapter
+        self.chat_pooling.send_message(response_message, table_name=table_name)
+        logger.debug(f'>>chatbot {chat_id} out (holding message): {response_message.text}')
 
     def _on_message(self, message: ChatBotMessage, chat_id, chat_memory, table_name=None):
         # add question to history

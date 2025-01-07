@@ -36,14 +36,20 @@ class Column:
 
 
 class ResultSet:
-    def __init__(self, columns=None, values: List[List] = None):
+    def __init__(self, columns=None, values: List[List] = None, df: pd.DataFrame = None):
+        '''
+
+        :param columns: list of Columns
+        :param values: data of resultSet, have to be list of lists with length equal to column
+        :param df: injected dataframe, have to have enumerated columns and length equal to columns
+        '''
         if columns is None:
             columns = []
         self._columns = columns
 
         if values is None:
             df = None
-        else:
+        elif df is None:
             df = pd.DataFrame(values)
         self._df = df
 
@@ -58,6 +64,11 @@ class ResultSet:
         if self._df is None:
             return 0
         return len(self._df)
+
+    def __getitem__(self, slice_val):
+        # return resultSet with sliced dataframe
+        df = self._df[slice_val]
+        return ResultSet(columns=self.columns, df=df)
 
     # --- converters ---
 
@@ -223,8 +234,14 @@ class ResultSet:
             self._df = pd.concat([self._df, df], ignore_index=True)
 
     def add_raw_values(self, values):
-
-        df = pd.DataFrame(values)
+        # If some values are None, the DataFrame could have incorrect integer types, since 'NaN' is technically a float, so it will convert ints to floats automatically.
+        df = pd.DataFrame(values).convert_dtypes(
+            convert_integer=True,
+            convert_floating=True,
+            infer_objects=False,
+            convert_string=False,
+            convert_boolean=False
+        )
         self.add_raw_df(df)
 
     def to_lists(self, json_types=False):
@@ -246,7 +263,8 @@ class ResultSet:
             return df.to_records(index=False).tolist()
 
         # slower but keep timestamp type
-        return self._df.to_dict('split')['data']
+        df = self._df.replace({np.nan: None})
+        return df.to_dict('split')['data']
 
     def get_column_values(self, col_idx):
         # get by column index

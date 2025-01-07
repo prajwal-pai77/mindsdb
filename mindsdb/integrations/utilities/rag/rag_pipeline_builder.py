@@ -1,7 +1,5 @@
 import pandas as pd
 from langchain.storage import InMemoryByteStore
-
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.runnables import RunnableSerializable
 from mindsdb.integrations.utilities.rag.pipelines.rag import LangChainRAGPipeline
 from mindsdb.integrations.utilities.rag.settings import (
@@ -10,6 +8,7 @@ from mindsdb.integrations.utilities.rag.settings import (
 )
 from mindsdb.integrations.utilities.rag.utils import documents_to_df
 from mindsdb.utilities.log import getLogger
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = getLogger(__name__)
 
@@ -17,6 +16,7 @@ _retriever_strategies = {
     RetrieverType.VECTOR_STORE: lambda config: _create_pipeline_from_vector_store(config),
     RetrieverType.AUTO: lambda config: _create_pipeline_from_auto_retriever(config),
     RetrieverType.MULTI: lambda config: _create_pipeline_from_multi_retriever(config),
+    RetrieverType.SQL: lambda config: _create_pipeline_from_sql_retriever(config)
 }
 
 
@@ -43,6 +43,12 @@ def _create_pipeline_from_multi_retriever(config: RAGPipelineModel) -> LangChain
         config.parent_store = InMemoryByteStore()
 
     return LangChainRAGPipeline.from_multi_vector_retriever(
+        config=config
+    )
+
+
+def _create_pipeline_from_sql_retriever(config: RAGPipelineModel) -> LangChainRAGPipeline:
+    return LangChainRAGPipeline.from_sql_retriever(
         config=config
     )
 

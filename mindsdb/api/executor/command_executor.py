@@ -6,9 +6,8 @@ from functools import reduce
 
 import pandas as pd
 from mindsdb_evaluator.accuracy.general import evaluate_accuracy
-from mindsdb_sql import parse_sql
-from mindsdb_sql.planner.utils import query_traversal
-from mindsdb_sql.parser.ast import (
+from mindsdb_sql_parser import parse_sql
+from mindsdb_sql_parser.ast import (
     Alter,
     ASTNode,
     BinaryOperation,
@@ -40,7 +39,7 @@ from mindsdb_sql.parser.ast import (
 )
 
 # typed models
-from mindsdb_sql.parser.dialects.mindsdb import (
+from mindsdb_sql_parser.ast.mindsdb import (
     CreateAgent,
     CreateAnomalyDetectionModel,
     CreateChatBot,
@@ -70,6 +69,8 @@ from mindsdb_sql.parser.dialects.mindsdb import (
 )
 
 import mindsdb.utilities.profiler as profiler
+
+from mindsdb.integrations.utilities.query_traversal import query_traversal
 from mindsdb.api.executor import Column, SQLQuery, ResultSet
 from mindsdb.api.executor.data_types.answer import ExecuteAnswer
 from mindsdb.api.mysql.mysql_proxy.libs.constants.mysql import (
@@ -106,6 +107,7 @@ from mindsdb.utilities.context import context as ctx
 from mindsdb.utilities.functions import mark_process, resolve_model_identifier, get_handler_install_message
 from mindsdb.utilities.exception import EntityExistsError, EntityNotExistsError
 from mindsdb.utilities import log
+from mindsdb.api.mysql.mysql_proxy.utilities import ErParseError
 
 logger = log.getLogger(__name__)
 
@@ -641,7 +643,7 @@ class ExecuteCommands:
         elif type(statement) is UpdateAgent:
             return self.answer_update_agent(statement, database_name)
         elif type(statement) is Evaluate:
-            statement.data = parse_sql(statement.query_str, dialect="mindsdb")
+            statement.data = parse_sql(statement.query_str)
             return self.answer_evaluate_metric(statement, database_name)
         else:
             logger.warning(f"Unknown SQL statement: {sql}")
@@ -1036,6 +1038,9 @@ class ExecuteCommands:
         storage = None
         try:
             handler_meta = self.session.integration_controller.get_handler_meta(engine)
+            if handler_meta is None:
+                raise ExecutorException(f"There is no engine '{engine}'")
+
             if handler_meta.get("import", {}).get("success") is not True:
                 raise ExecutorException(f"The '{engine}' handler isn't installed.\n" + get_handler_install_message(engine))
 
@@ -1253,7 +1258,7 @@ class ExecuteCommands:
             project_name = parts[0]
 
         query_str = statement.query_str
-        query = parse_sql(query_str, dialect="mindsdb")
+        query = parse_sql(query_str)
 
         if isinstance(statement.from_table, Identifier):
             query = Select(
@@ -1478,7 +1483,7 @@ class ExecuteCommands:
                 skills_to_remove=skills_to_remove,
                 params=statement.params
             )
-        except ValueError as e:
+        except (EntityExistsError, EntityNotExistsError, ValueError) as e:
             # Project does not exist or agent does not exist.
             raise ExecutorException(str(e))
 
@@ -1601,6 +1606,13 @@ class ExecuteCommands:
             if isinstance(node, Identifier):
                 if node.parts[-1].lower() == "session_user":
                     return Constant(self.session.username, alias=node)
+                if node.parts[-1].lower() == '$$':
+                    # NOTE: sinve version 9.0 mysql client sends query 'select $$'.
+                    # Connection can be continued only if answer is parse error.
+                    raise ErParseError(
+                        "You have an error in your SQL syntax; check the manual that corresponds to your server "
+                        "version for the right syntax to use near '$$' at line 1"
+                    )
 
             if isinstance(node, Function):
                 function_name = node.op.lower()

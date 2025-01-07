@@ -1,5 +1,4 @@
 import os
-import datetime
 import secrets
 import mimetypes
 import threading
@@ -51,6 +50,9 @@ from mindsdb.utilities.json_encoder import CustomJSONProvider
 from mindsdb.utilities.ps import is_pid_listen_port, wait_func_is_true
 from mindsdb.utilities.telemetry import inject_telemetry_to_static
 from mindsdb.utilities.sentry import sentry_sdk  # noqa: F401
+from mindsdb.utilities.otel import trace  # noqa: F401
+from opentelemetry.instrumentation.flask import FlaskInstrumentor  # noqa: F401
+from opentelemetry.instrumentation.requests import RequestsInstrumentor  # noqa: F401
 
 logger = log.getLogger(__name__)
 
@@ -218,7 +220,19 @@ def initialize_app(config, no_studio):
                 'Not found',
                 'The endpoint you are trying to access does not exist on the server.'
             )
-        if static_root.joinpath(path).is_file():
+
+        # Normalize the path.
+        full_path = os.path.normpath(os.path.join(static_root, path))
+
+        # Check for directory traversal attacks.
+        if not full_path.startswith(str(static_root)):
+            return http_error(
+                HTTPStatus.FORBIDDEN,
+                'Forbidden',
+                'You are not allowed to access the requested resource.'
+            )
+
+        if os.path.isfile(full_path):
             return send_from_directory(static_root, path)
         else:
             return send_from_directory(static_root, 'index.html')
@@ -276,7 +290,7 @@ def initialize_app(config, no_studio):
 
     @app.before_request
     def before_request():
-        logger.debug(f"HTTP: {request.path}")
+        logger.debug(f"HTTP {request.method}: {request.path}")
         ctx.set_default()
         config = Config()
 
@@ -287,7 +301,7 @@ def initialize_app(config, no_studio):
             and check_auth() is False
         ):
             return http_error(
-                403, 'Forbidden',
+                HTTPStatus.UNAUTHORIZED, 'Unauthorized',
                 'Authorization is required to complete the request'
             )
         # endregion
@@ -297,8 +311,18 @@ def initialize_app(config, no_studio):
 
         try:
             email_confirmed = int(request.headers.get('email-confirmed', 1))
-        except ValueError:
+        except Exception:
             email_confirmed = 1
+
+        try:
+            user_id = int(request.headers.get('user-id', 0))
+        except Exception:
+            user_id = 0
+
+        try:
+            session_id = request.cookies.get('session')
+        except Exception:
+            session_id = "unknown"
 
         if company_id is not None:
             try:
@@ -320,6 +344,8 @@ def initialize_app(config, no_studio):
         else:
             user_class = 0
 
+        ctx.user_id = user_id
+        ctx.session_id = session_id
         ctx.company_id = company_id
         ctx.user_class = user_class
         ctx.email_confirmed = email_confirmed
@@ -351,9 +377,13 @@ def initialize_flask(config, init_static_thread, no_studio):
     app = Flask(__name__, **kwargs)
     init_metrics(app)
 
+    # Instrument Flask app for OpenTelemetry
+    FlaskInstrumentor().instrument_app(app)
+    RequestsInstrumentor().instrument()
+
     app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', secrets.token_hex(32))
     app.config['SESSION_COOKIE_NAME'] = 'session'
-    app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(days=31)
+    app.config['PERMANENT_SESSION_LIFETIME'] = config['auth']['http_permanent_session_lifetime']
     app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 60
     app.config['SWAGGER_HOST'] = 'http://localhost:8000/mindsdb'
     app.json = CustomJSONProvider()
